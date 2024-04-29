@@ -9,6 +9,32 @@ from .models import register_meta_arch, make_backbone, make_neck, make_generator
 from ..utils import batched_nms
 
 
+class BWA_fusion_dropout_feat(torch.nn.Module): # CO2-Net标准结构
+    def __init__(self, n_feature, n_class):
+        super().__init__()
+        embed_dim = 1024
+        self.bit_wise_attn = nn.Sequential(
+            nn.Conv1d(n_feature, embed_dim, (3,), padding=1), nn.LeakyReLU(0.2), nn.Dropout(0.5))
+        self.channel_conv = nn.Sequential(
+            nn.Conv1d(n_feature, embed_dim, (3,), padding=1), nn.LeakyReLU(0.2), nn.Dropout(0.5))
+        self.attention = nn.Sequential(nn.Conv1d(embed_dim, 512, (3,), padding=1),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Dropout(0.5),
+                                       nn.Conv1d(512, 512, (3,), padding=1),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Conv1d(512, 1, (1,)),
+                                       nn.Dropout(0.5),
+                                       nn.Sigmoid())
+        self.channel_avg = nn.AdaptiveAvgPool1d(1)
+
+    def forward(self, vfeat, ffeat, is_training=False):
+        channelfeat = self.channel_avg(vfeat)
+        channel_attn = self.channel_conv(channelfeat)
+        bit_wise_attn = self.bit_wise_attn(ffeat)
+        filter_feat = torch.sigmoid(bit_wise_attn * channel_attn) * vfeat
+        x_atn = self.attention(filter_feat)
+        return x_atn, filter_feat
+
 class ClsHead(nn.Module):
     """
     1D Conv heads for classification
@@ -25,7 +51,8 @@ class ClsHead(nn.Module):
             act_layer=nn.ReLU,
             with_ln=False,
             empty_cls=[],
-            detach_feat=False
+            detach_feat=False,
+            with_sigmoid=False, # 是否最终有sigmoid激活值
     ):
         super().__init__()
         self.act = act_layer()
@@ -74,6 +101,10 @@ class ClsHead(nn.Module):
             bias_value = -(math.log((1 - 1e-6) / 1e-6))
             for idx in empty_cls:
                 torch.nn.init.constant_(self.cls_head.conv.bias[idx], bias_value)
+        
+        self.with_sigmoid = with_sigmoid
+        if self.with_sigmoid:
+            self.sigmoid = nn.Sigmoid()
 
     def forward(self, fpn_feats, fpn_masks):
         assert len(fpn_feats) == len(fpn_masks)
@@ -89,6 +120,8 @@ class ClsHead(nn.Module):
                 cur_out, _ = self.head[idx](cur_out, cur_mask)
                 cur_out = self.act(self.norm[idx](cur_out))
             cur_logits, _ = self.cls_head(cur_out, cur_mask)
+            if self.with_sigmoid: # 是否有sigmoid重分布
+                cur_logits = self.sigmoid(cur_logits)
             out_logits += (cur_logits,)
 
         # fpn_masks remains the same
@@ -415,7 +448,7 @@ class TriDet(nn.Module):
         import json
         with open("/data0/lixunsong/Datasets/thumos/annotations/thumos14.json") as f:
             self.gt = json.load(f)
-            maps = {3:29,10:65,11:70,12:79,13:86,14:127,15:153,18:41}
+            maps = {3:3,10:10,11:11,12:12,13:13,14:14,15:15,18:18} # {3:29,10:65,11:70,12:79,13:86,14:127,15:153,18:41}
             for video_id, video_data in self.gt["database"].items():
                 # Check if the video_data contains 'annotations' key
                 if 'annotations' in video_data:
@@ -862,14 +895,12 @@ class TriDet(nn.Module):
             )
 
             #############################################
-            '''
             self.visualize_single_video(
                 points, fpn_masks_per_vid,
                 cls_logits_per_vid, offsets_per_vid,
                 lb_logits_per_vid, rb_logits_per_vid,
                 vlen, vidx
             )
-            '''
             #############################################
 
             # pass through video meta info
@@ -1042,7 +1073,7 @@ class TriDet(nn.Module):
         import os
         import numpy as np
 
-        base_dir = "outputs/a2t"
+        base_dir = "outputs/thumos"
 
         gt = self.gt["database"][vidx] # duration: xx annotations [  {'label_id' 'segment'}  ]
 
@@ -1061,9 +1092,8 @@ class TriDet(nn.Module):
             tot += 1
             pred_prob = (cls_i.sigmoid() * mask_i.unsqueeze(-1)).flatten()
 
-            if tot == 5:
-                cls_output = cls_i.sigmoid() * mask_i.unsqueeze(-1)
-                duration = len(cls_output)
+            cls_output = cls_i.sigmoid() * mask_i.unsqueeze(-1)
+            duration = len(cls_output)
             
 
             # Apply filtering to make NMS faster following detectron2
@@ -1130,177 +1160,153 @@ class TriDet(nn.Module):
             scores_all.append(pred_prob[keep_idxs2])
             cls_idxs_all.append(cls_idxs[keep_idxs2])
 
-            if tot == 5:
-                if not os.path.exists(os.path.join(base_dir, vidx)):
-                    os.makedirs(os.path.join(base_dir, vidx))
+
+            if not os.path.exists(os.path.join(base_dir, vidx)):
+                os.makedirs(os.path.join(base_dir, vidx))
+            
+            dir_path = os.path.join(base_dir, vidx)
+            real_l = int(sum(mask_i).cpu())
+
+            for i in range(20): # 20个class 第i+1 class
+                data_for_class_i = cls_output[mask_i][:,i].cpu()
+
+                ######################## cas
+                plt.figure()
+                has = False
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                        has = True
+                if has == False:
+                    plt.close()
+                    continue
+                plt.plot(np.array(data_for_class_i))
+                plt.title(f'Class {i+1} Scale {tot}')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
+
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'fpn_{tot}_cls_{i+1}.png')
+                plt.savefig(plot_filename)
+
+                # Close the plot to free up resources
+                plt.close()
+                ########################
+
+                '''
+                ######################## start
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                st = np.zeros(real_l)
+                selected = cls_idxs_all[tot]==(i+1)
+                sgs = segs_all[tot][selected]
+                scs = scores_all[tot][selected]
+
+                for k in range(len(sgs)): # sg in sgs:
+                    st[int(sgs[k][0])]+=scs[k]
                 
-                dir_path = os.path.join(base_dir, vidx)
-                real_l = int(sum(mask_i).cpu())
+                plt.plot(st,color="green")
+                plt.title(f'Class {i+1} Start')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
 
-                for i in range(200): # 20个class 第i+1 class
-                    data_for_class_i = cls_output[mask_i][:,i].cpu()
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'start_{i+1}.png')
+                plt.savefig(plot_filename)
 
-                    ######################## cas
-                    plt.figure()
-                    has = False
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                            has = True
-                    if has == False:
-                        plt.close()
-                        continue
-                    plt.plot(np.array(data_for_class_i))
-                    plt.title(f'Class {i+1} Plot')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Close the plot to free up resources
+                plt.close()
+                ########################
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'cls_{i+1}.png')
-                    plt.savefig(plot_filename)
+                ######################## end
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                st = np.zeros(real_l)
+                selected = cls_idxs_all[tot]==(i+1)
+                sgs = segs_all[tot][selected]
+                scs = scores_all[tot][selected]
 
-                    # Close the plot to free up resources
-                    plt.close()
-                    ########################
+                for k in range(len(sgs)): # sg in sgs:
+                    st[min(int(sgs[k][1]), real_l-1)]+=scs[k]
+                
+                plt.plot(st,color="purple")
+                plt.title(f'Class {i+1} End')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
 
-                    '''
-                    ######################## start
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    st = np.zeros(real_l)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    sgs = segs_all[tot][selected]
-                    scs = scores_all[tot][selected]
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'end_{i+1}.png')
+                plt.savefig(plot_filename)
 
-                    for k in range(len(sgs)): # sg in sgs:
-                        st[int(sgs[k][0])]+=scs[k]
-                    
-                    plt.plot(st,color="green")
-                    plt.title(f'Class {i+1} Start')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Close the plot to free up resources
+                plt.close()
+                ########################
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'start_{i+1}.png')
-                    plt.savefig(plot_filename)
+                ######################## start-end
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                st = np.zeros(real_l)
+                ed = np.zeros(real_l)
+                selected = cls_idxs_all[tot]==(i+1)
+                sgs = segs_all[tot][selected]
+                scs = scores_all[tot][selected]
 
-                    # Close the plot to free up resources
-                    plt.close()
-                    ########################
+                for k in range(len(sgs)): # sg in sgs:
+                    st[max(0,min(int(sgs[k][0]), real_l-1))]+=scs[k]
+                    ed[max(0,min(int(sgs[k][1]), real_l-1))]+=scs[k]
+                
+                plt.plot(st,color="purple",label="start")
+                plt.plot(ed,color="green",label="end")
+                plt.legend()
+                plt.title(f'Class {i+1} Start-End')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
 
-                    ######################## end
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    st = np.zeros(real_l)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    sgs = segs_all[tot][selected]
-                    scs = scores_all[tot][selected]
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'start_end_{i+1}.png')
+                plt.savefig(plot_filename)
 
-                    for k in range(len(sgs)): # sg in sgs:
-                        st[min(int(sgs[k][1]), real_l-1)]+=scs[k]
-                    
-                    plt.plot(st,color="purple")
-                    plt.title(f'Class {i+1} End')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Close the plot to free up resources
+                plt.close()
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'end_{i+1}.png')
-                    plt.savefig(plot_filename)
+                ######################## segments
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                selected = cls_idxs_all[tot]==(i+1)
+                # no prediction
 
-                    # Close the plot to free up resources
-                    plt.close()
-                    ########################
-                    '''
+                sgs = segs_all[tot][selected].cpu()
+                scs = scores_all[tot][selected].cpu()
 
-                    ######################## start-end
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    st = np.zeros(real_l)
-                    ed = np.zeros(real_l)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    sgs = segs_all[tot][selected]
-                    scs = scores_all[tot][selected]
+                combined = list(zip(sgs, scs))
 
-                    for k in range(len(sgs)): # sg in sgs:
-                        st[max(0,min(int(sgs[k][0]), real_l-1))]+=scs[k]
-                        ed[max(0,min(int(sgs[k][1]), real_l-1))]+=scs[k]
-                    
-                    plt.plot(st,color="purple",label="start")
-                    plt.plot(ed,color="green",label="end")
-                    plt.legend()
-                    plt.title(f'Class {i+1} Start-End')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Sort the combined list based on the values in scs in descending order
+                combined.sort(key=lambda x: x[1], reverse=True)
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'start_end_{i+1}.png')
-                    plt.savefig(plot_filename)
-
-                    # Close the plot to free up resources
-                    plt.close()
-
-                    ######################## segments
-                    '''
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    # no prediction
-
-                    sgs = segs_all[tot][selected].cpu()
-                    scs = scores_all[tot][selected].cpu()
-
-                    combined = list(zip(sgs, scs))
-
-                    # Sort the combined list based on the values in scs in descending order
-                    combined.sort(key=lambda x: x[1], reverse=True)
-
-                    # Unzip the sorted list back into separate sgs and scs lists
-                    if len(combined) == 0:
-                        plt.title(f'Class {i+1} Segments')
-                        plt.xlabel('Temporal')
-                        plt.ylabel('Scores')
-
-                        plt.tight_layout()
-                        # Save the plot to the specified path
-                        plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
-                        plt.savefig(plot_filename)
-
-                        # Close the plot to free up resources
-                        plt.close()
-                        continue
-                    
-                    sgs, scs = zip(*combined)
-
-                    sgs = list(sgs)
-                    scs = list(scs)
-
-                    # Plot line segments
-                    for k in range(min(len(sgs),30)):
-                        plt.plot([sgs[k][0], sgs[k][1]], [scs[k], scs[k]], color='darkgreen')
-
+                # Unzip the sorted list back into separate sgs and scs lists
+                if len(combined) == 0:
                     plt.title(f'Class {i+1} Segments')
                     plt.xlabel('Temporal')
                     plt.ylabel('Scores')
@@ -1312,8 +1318,30 @@ class TriDet(nn.Module):
 
                     # Close the plot to free up resources
                     plt.close()
-                    '''
-                    ########################
+                    continue
+                
+                sgs, scs = zip(*combined)
+
+                sgs = list(sgs)
+                scs = list(scs)
+
+                # Plot line segments
+                for k in range(min(len(sgs),30)):
+                    plt.plot([sgs[k][0], sgs[k][1]], [scs[k], scs[k]], color='darkgreen')
+
+                plt.title(f'Class {i+1} Segments')
+                plt.xlabel('Temporal')
+                plt.ylabel('Scores')
+
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
+                plt.savefig(plot_filename)
+
+                # Close the plot to free up resources
+                plt.close()
+                '''
+                ########################
 
         # cat along the FPN levels (F N_i, C)
         segs_all, scores_all, cls_idxs_all = [
@@ -2224,13 +2252,17 @@ class PseudoFormer(nn.Module):
         )
 
         # classfication and regerssion heads
-        self.cls_head = ClsHead(
-            fpn_dim, head_dim, self.num_classes,
+        self.cas_head = BWA_fusion_dropout_feat( # 这里我们把cls_head和CAS值直接进行匹配 CAS的原版最终是一个sigmoid形 这里是一个conv1d
+            head_dim, self.num_classes, # 这里多加了一个背景类
+        )
+        self.cls_head = ClsHead( # 这是原来的cls_head 我现在改了
+            fpn_dim, head_dim, self.num_classes+1,
             kernel_size=head_kernel_size,
             prior_prob=self.train_cls_prior_prob,
             with_ln=head_with_ln,
             num_layers=head_num_layers,
-            empty_cls=train_cfg['head_empty_cls']
+            empty_cls=train_cfg['head_empty_cls'],
+            with_sigmoid=True,
         )
 
         if use_trident_head:
@@ -2332,7 +2364,7 @@ class PseudoFormer(nn.Module):
         # forward the network (backbone -> neck -> heads)
         # fpn_feats: (B, C, T) (B, C, T//2) (B, C, T//4) (B, C, T//8) (B, C, T//32) (B, C, T//64)
         feats, masks = self.backbone(batched_inputs, batched_masks)
-        fpn_feats, fpn_masks = self.neck(feats, masks)
+        fpn_feats, fpn_masks = self.neck(feats, masks) # 这里要做个实验，一个是用了neck的，一个不用neck的
 
         # compute the point coordinate along the FPN
         # this is used for computing the GT or decode the final results
@@ -2354,6 +2386,9 @@ class PseudoFormer(nn.Module):
         # out_offset: List[B, 2, T_i]
         out_offsets = self.reg_head(fpn_feats, fpn_masks)
 
+        fpn_id = 0
+        attention, cas = self.cas_head(feats[fpn_id:fpn_id+1], fpn_masks[fpn_id:fpn_id+1]) # 只使用一个层
+   
         # permute the outputs
         # out_cls: F List[B, #cls, T_i] -> F List[B, T_i, #cls]
         out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
@@ -2381,8 +2416,15 @@ class PseudoFormer(nn.Module):
                 out_cls_logits, out_offsets,
                 gt_cls_labels, gt_offsets,
                 out_lb_logits, out_rb_logits,
-            )
+            ) # {'cls_loss': , 'reg_loss': , 'final_loss': }
+
+            '''
+            weakly_losses = self.weakly_losses(
+                fpn_masks[fpn_id:fpn_id+1], 
+                cas,
+                gt_cls_labels)
             return losses
+            '''
 
         else:
             # decode the actions (sigmoid / stride, etc)
@@ -2392,6 +2434,136 @@ class PseudoFormer(nn.Module):
                 out_lb_logits, out_rb_logits,
             )
             return results
+    
+    def _multiply(self, x, atn, dim=-1, include_min=False):
+        if include_min:
+            _min = x.min(dim=dim, keepdim=True)[0]
+        else:
+            _min = 0
+        return atn * (x - _min) + _min
+    
+    def weakly_losses(self, fpn_masks, cas, labels, topk=7):
+        feat, element_logits, element_atn = outputs['feat'], outputs['cas'], outputs['attn']
+        v_atn = outputs['v_atn']
+        f_atn = outputs['f_atn']
+        mutual_loss = 0.5 * F.mse_loss(v_atn, f_atn.detach()) + 0.5 * F.mse_loss(f_atn, v_atn.detach())
+
+        element_logits_supp = self._multiply(element_logits, element_atn, include_min=True)
+
+        loss_mil_orig, _ = self.topkloss(element_logits,
+                                         labels,
+                                         is_back=True,
+                                         rat=topk)
+
+        # SAL
+        loss_mil_supp, _ = self.topkloss(element_logits_supp,
+                                         labels,
+                                         is_back=False,
+                                         rat=topk)
+
+        loss_3_supp_Contrastive = self.Contrastive(feat, element_logits_supp, labels, is_back=False)
+
+        loss_norm = element_atn.mean()
+        # guide loss
+        loss_guide = (1 - element_atn -
+                      element_logits.softmax(-1)[..., [-1]]).abs().mean()
+
+        v_loss_norm = v_atn.mean()
+        # guide loss
+        v_loss_guide = (1 - v_atn -
+                        element_logits.softmax(-1)[..., [-1]]).abs().mean()
+
+        f_loss_norm = f_atn.mean()
+        # guide loss
+        f_loss_guide = (1 - f_atn -
+                        element_logits.softmax(-1)[..., [-1]]).abs().mean()
+
+        total_loss = (
+                    loss_mil_orig.mean() + loss_mil_supp.mean() +
+                    args['opt'].alpha3 * loss_3_supp_Contrastive +
+                    args['opt'].alpha4 * mutual_loss +
+                    args['opt'].alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3 +
+                    args['opt'].alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3)
+
+        loss_dict = {
+            'loss_mil_orig': loss_mil_orig.mean(),
+            'loss_mil_supp': loss_mil_supp.mean(),
+            'loss_supp_contrastive': args['opt'].alpha3 * loss_3_supp_Contrastive,
+            'mutual_loss': args['opt'].alpha4 * mutual_loss,
+            'norm_loss': args['opt'].alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3,
+            'guide_loss': args['opt'].alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3,
+            'total_loss': total_loss,
+        }
+
+        return total_loss, loss_dict
+
+    
+    def topkloss(self,
+                 element_logits,
+                 labels,
+                 is_back=True,
+                 rat=8):
+
+        if is_back:
+            labels_with_back = torch.cat(
+                (labels, torch.ones_like(labels[:, [0]])), dim=-1)
+        else:
+            labels_with_back = torch.cat(
+                (labels, torch.zeros_like(labels[:, [0]])), dim=-1)
+
+        topk_val, topk_ind = torch.topk(
+            element_logits,
+            k=max(1, int(element_logits.shape[-2] // rat)),
+            dim=-2)
+
+        instance_logits = torch.mean(topk_val, dim=-2)
+
+        labels_with_back = labels_with_back / (
+                torch.sum(labels_with_back, dim=1, keepdim=True) + 1e-4)
+
+        milloss = - (labels_with_back * F.log_softmax(instance_logits, dim=-1)).sum(dim=-1)
+
+        return milloss, topk_ind
+
+    def Contrastive(self, x, element_logits, labels, is_back=False):
+        if is_back:
+            labels = torch.cat(
+                (labels, torch.ones_like(labels[:, [0]])), dim=-1)
+        else:
+            labels = torch.cat(
+                (labels, torch.zeros_like(labels[:, [0]])), dim=-1)
+        sim_loss = 0.
+        n_tmp = 0.
+        _, n, c = element_logits.shape
+        for i in range(0, 3 * 2, 2):
+            atn1 = F.softmax(element_logits[i], dim=0)
+            atn2 = F.softmax(element_logits[i + 1], dim=0)
+
+            n1 = torch.FloatTensor([np.maximum(n - 1, 1)]).to(self.device)
+            n2 = torch.FloatTensor([np.maximum(n - 1, 1)]).to(self.device)
+            Hf1 = torch.mm(torch.transpose(x[i], 1, 0), atn1)  # (n_feature, n_class)
+            Hf2 = torch.mm(torch.transpose(x[i + 1], 1, 0), atn2)
+            Lf1 = torch.mm(torch.transpose(x[i], 1, 0), (1 - atn1) / n1)
+            Lf2 = torch.mm(torch.transpose(x[i + 1], 1, 0), (1 - atn2) / n2)
+
+            d1 = 1 - torch.sum(Hf1 * Hf2, dim=0) / (
+                    torch.norm(Hf1, 2, dim=0) * torch.norm(Hf2, 2, dim=0))  # 1-similarity
+            d2 = 1 - torch.sum(Hf1 * Lf2, dim=0) / (torch.norm(Hf1, 2, dim=0) * torch.norm(Lf2, 2, dim=0))
+            d3 = 1 - torch.sum(Hf2 * Lf1, dim=0) / (torch.norm(Hf2, 2, dim=0) * torch.norm(Lf1, 2, dim=0))
+            sim_loss = sim_loss + 0.5 * torch.sum(
+                torch.max(d1 - d2 + 0.5, torch.FloatTensor([0.]).to(self.device)) * labels[i, :] * labels[i + 1, :])
+            sim_loss = sim_loss + 0.5 * torch.sum(
+                torch.max(d1 - d3 + 0.5, torch.FloatTensor([0.]).to(self.device)) * labels[i, :] * labels[i + 1, :])
+            n_tmp = n_tmp + torch.sum(labels[i, :] * labels[i + 1, :])
+        sim_loss = sim_loss / n_tmp
+        return sim_loss
+    
+    def _multiply(self, x, atn, dim=-1, include_min=False):
+        if include_min:
+            _min = x.min(dim=dim, keepdim=True)[0]
+        else:
+            _min = 0
+        return atn * (x - _min) + _min
 
     @torch.no_grad()
     def preprocessing(self, video_list, padding_val=0.0):
@@ -2449,7 +2621,7 @@ class PseudoFormer(nn.Module):
             cls_targets, reg_targets = self.label_points_single_video(
                 concat_points, gt_segment, gt_label
             )
-            # append to list (len = # images, each of size FT x C)
+            # append to list (len = # images, each of size FT x C+1)
             gt_cls.append(cls_targets)
             gt_offset.append(reg_targets)
 
@@ -2508,7 +2680,6 @@ class PseudoFormer(nn.Module):
         # limit the regression range for each location
         max_regress_distance = reg_targets.max(-1)[0]
         # F T x N
-        # 测试6model 删
         inside_regress_range = torch.logical_and(
             (max_regress_distance >= concat_points[:, 1, None]),
             (max_regress_distance <= concat_points[:, 2, None])
@@ -2517,7 +2688,7 @@ class PseudoFormer(nn.Module):
         # if there are still more than one actions for one moment
         # pick the one with the shortest duration (easiest to regress)
         lens.masked_fill_(inside_gt_seg_mask == 0, float('inf'))
-        # 测试6model 删
+
         lens.masked_fill_(inside_regress_range == 0, float('inf'))
         # F T x N -> F T
         min_len, min_len_inds = lens.min(dim=1)
@@ -2547,8 +2718,8 @@ class PseudoFormer(nn.Module):
             gt_cls_labels, gt_offsets,
             out_start, out_end,
     ):
-        # fpn_masks, out_*: F (List) [B, T_i, C]
-        # gt_* : B (list) [F T, C]
+        # fpn_masks, out_*: F (List) [B, T_i, C+1]
+        # gt_* : B (list) [F T, C+1]
         # fpn_masks -> (B, FT)
         valid_mask = torch.cat(fpn_masks, dim=1)
 
@@ -2618,7 +2789,7 @@ class PseudoFormer(nn.Module):
                 gt_offsets,
                 reduction='none'
             )
-            rated_mask = gt_target > self.train_label_smoothing / (self.num_classes + 1)
+            rated_mask = gt_target > self.train_label_smoothing / (self.num_classes + 1) # 这里得加2了
             cls_loss[rated_mask] *= (1 - iou_rate) ** self.iou_weight_power
 
         cls_loss = cls_loss.sum()
@@ -2692,14 +2863,14 @@ class PseudoFormer(nn.Module):
             )
 
             #############################################
-            '''
+            
             self.visualize_single_video(
                 points, fpn_masks_per_vid,
                 cls_logits_per_vid, offsets_per_vid,
                 lb_logits_per_vid, rb_logits_per_vid,
                 vlen, vidx
             )
-            '''
+            
             #############################################
 
             # pass through video meta info
@@ -2872,7 +3043,7 @@ class PseudoFormer(nn.Module):
         import os
         import numpy as np
 
-        base_dir = "outputs/a2t"
+        base_dir = "outputs/thumos"
 
         gt = self.gt["database"][vidx] # duration: xx annotations [  {'label_id' 'segment'}  ]
 
@@ -2891,9 +3062,8 @@ class PseudoFormer(nn.Module):
             tot += 1
             pred_prob = (cls_i.sigmoid() * mask_i.unsqueeze(-1)).flatten()
 
-            if tot == 5:
-                cls_output = cls_i.sigmoid() * mask_i.unsqueeze(-1)
-                duration = len(cls_output)
+            cls_output = cls_i.sigmoid() * mask_i.unsqueeze(-1)
+            duration = len(cls_output)
             
 
             # Apply filtering to make NMS faster following detectron2
@@ -2960,177 +3130,153 @@ class PseudoFormer(nn.Module):
             scores_all.append(pred_prob[keep_idxs2])
             cls_idxs_all.append(cls_idxs[keep_idxs2])
 
-            if tot == 5:
-                if not os.path.exists(os.path.join(base_dir, vidx)):
-                    os.makedirs(os.path.join(base_dir, vidx))
+
+            if not os.path.exists(os.path.join(base_dir, vidx)):
+                os.makedirs(os.path.join(base_dir, vidx))
+            
+            dir_path = os.path.join(base_dir, vidx)
+            real_l = int(sum(mask_i).cpu())
+
+            for i in range(20): # 20个class 第i+1 class
+                data_for_class_i = cls_output[mask_i][:,i].cpu()
+
+                ######################## cas
+                plt.figure()
+                has = False
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                        has = True
+                if has == False:
+                    plt.close()
+                    continue
+                plt.plot(np.array(data_for_class_i))
+                plt.title(f'Class {i+1} Scale {tot}')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
+
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'fpn_{tot}_cls_{i+1}.png')
+                plt.savefig(plot_filename)
+
+                # Close the plot to free up resources
+                plt.close()
+                ########################
+
+                '''
+                ######################## start
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                st = np.zeros(real_l)
+                selected = cls_idxs_all[tot]==(i+1)
+                sgs = segs_all[tot][selected]
+                scs = scores_all[tot][selected]
+
+                for k in range(len(sgs)): # sg in sgs:
+                    st[int(sgs[k][0])]+=scs[k]
                 
-                dir_path = os.path.join(base_dir, vidx)
-                real_l = int(sum(mask_i).cpu())
+                plt.plot(st,color="green")
+                plt.title(f'Class {i+1} Start')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
 
-                for i in range(200): # 20个class 第i+1 class
-                    data_for_class_i = cls_output[mask_i][:,i].cpu()
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'start_{i+1}.png')
+                plt.savefig(plot_filename)
 
-                    ######################## cas
-                    plt.figure()
-                    has = False
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                            has = True
-                    if has == False:
-                        plt.close()
-                        continue
-                    plt.plot(np.array(data_for_class_i))
-                    plt.title(f'Class {i+1} Plot')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Close the plot to free up resources
+                plt.close()
+                ########################
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'cls_{i+1}.png')
-                    plt.savefig(plot_filename)
+                ######################## end
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                st = np.zeros(real_l)
+                selected = cls_idxs_all[tot]==(i+1)
+                sgs = segs_all[tot][selected]
+                scs = scores_all[tot][selected]
 
-                    # Close the plot to free up resources
-                    plt.close()
-                    ########################
+                for k in range(len(sgs)): # sg in sgs:
+                    st[min(int(sgs[k][1]), real_l-1)]+=scs[k]
+                
+                plt.plot(st,color="purple")
+                plt.title(f'Class {i+1} End')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
 
-                    '''
-                    ######################## start
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    st = np.zeros(real_l)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    sgs = segs_all[tot][selected]
-                    scs = scores_all[tot][selected]
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'end_{i+1}.png')
+                plt.savefig(plot_filename)
 
-                    for k in range(len(sgs)): # sg in sgs:
-                        st[int(sgs[k][0])]+=scs[k]
-                    
-                    plt.plot(st,color="green")
-                    plt.title(f'Class {i+1} Start')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Close the plot to free up resources
+                plt.close()
+                ########################
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'start_{i+1}.png')
-                    plt.savefig(plot_filename)
+                ######################## start-end
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                st = np.zeros(real_l)
+                ed = np.zeros(real_l)
+                selected = cls_idxs_all[tot]==(i+1)
+                sgs = segs_all[tot][selected]
+                scs = scores_all[tot][selected]
 
-                    # Close the plot to free up resources
-                    plt.close()
-                    ########################
+                for k in range(len(sgs)): # sg in sgs:
+                    st[max(0,min(int(sgs[k][0]), real_l-1))]+=scs[k]
+                    ed[max(0,min(int(sgs[k][1]), real_l-1))]+=scs[k]
+                
+                plt.plot(st,color="purple",label="start")
+                plt.plot(ed,color="green",label="end")
+                plt.legend()
+                plt.title(f'Class {i+1} Start-End')
+                plt.xlabel('Temporal')
+                plt.ylabel('Values')
 
-                    ######################## end
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    st = np.zeros(real_l)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    sgs = segs_all[tot][selected]
-                    scs = scores_all[tot][selected]
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'start_end_{i+1}.png')
+                plt.savefig(plot_filename)
 
-                    for k in range(len(sgs)): # sg in sgs:
-                        st[min(int(sgs[k][1]), real_l-1)]+=scs[k]
-                    
-                    plt.plot(st,color="purple")
-                    plt.title(f'Class {i+1} End')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Close the plot to free up resources
+                plt.close()
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'end_{i+1}.png')
-                    plt.savefig(plot_filename)
+                ######################## segments
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                selected = cls_idxs_all[tot]==(i+1)
+                # no prediction
 
-                    # Close the plot to free up resources
-                    plt.close()
-                    ########################
-                    '''
+                sgs = segs_all[tot][selected].cpu()
+                scs = scores_all[tot][selected].cpu()
 
-                    ######################## start-end
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    st = np.zeros(real_l)
-                    ed = np.zeros(real_l)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    sgs = segs_all[tot][selected]
-                    scs = scores_all[tot][selected]
+                combined = list(zip(sgs, scs))
 
-                    for k in range(len(sgs)): # sg in sgs:
-                        st[max(0,min(int(sgs[k][0]), real_l-1))]+=scs[k]
-                        ed[max(0,min(int(sgs[k][1]), real_l-1))]+=scs[k]
-                    
-                    plt.plot(st,color="purple",label="start")
-                    plt.plot(ed,color="green",label="end")
-                    plt.legend()
-                    plt.title(f'Class {i+1} Start-End')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Values')
+                # Sort the combined list based on the values in scs in descending order
+                combined.sort(key=lambda x: x[1], reverse=True)
 
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'start_end_{i+1}.png')
-                    plt.savefig(plot_filename)
-
-                    # Close the plot to free up resources
-                    plt.close()
-
-                    ######################## segments
-                    '''
-                    plt.figure()
-                    for seg in gt["annotations"]:
-                        if seg["label_id"] == i+1:
-                            x1 = seg["segment"][0]/gt["duration"]*real_l
-                            x2 = seg["segment"][1]/gt["duration"]*real_l
-                            plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                    selected = cls_idxs_all[tot]==(i+1)
-                    # no prediction
-
-                    sgs = segs_all[tot][selected].cpu()
-                    scs = scores_all[tot][selected].cpu()
-
-                    combined = list(zip(sgs, scs))
-
-                    # Sort the combined list based on the values in scs in descending order
-                    combined.sort(key=lambda x: x[1], reverse=True)
-
-                    # Unzip the sorted list back into separate sgs and scs lists
-                    if len(combined) == 0:
-                        plt.title(f'Class {i+1} Segments')
-                        plt.xlabel('Temporal')
-                        plt.ylabel('Scores')
-
-                        plt.tight_layout()
-                        # Save the plot to the specified path
-                        plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
-                        plt.savefig(plot_filename)
-
-                        # Close the plot to free up resources
-                        plt.close()
-                        continue
-                    
-                    sgs, scs = zip(*combined)
-
-                    sgs = list(sgs)
-                    scs = list(scs)
-
-                    # Plot line segments
-                    for k in range(min(len(sgs),30)):
-                        plt.plot([sgs[k][0], sgs[k][1]], [scs[k], scs[k]], color='darkgreen')
-
+                # Unzip the sorted list back into separate sgs and scs lists
+                if len(combined) == 0:
                     plt.title(f'Class {i+1} Segments')
                     plt.xlabel('Temporal')
                     plt.ylabel('Scores')
@@ -3142,8 +3288,30 @@ class PseudoFormer(nn.Module):
 
                     # Close the plot to free up resources
                     plt.close()
-                    '''
-                    ########################
+                    continue
+                
+                sgs, scs = zip(*combined)
+
+                sgs = list(sgs)
+                scs = list(scs)
+
+                # Plot line segments
+                for k in range(min(len(sgs),30)):
+                    plt.plot([sgs[k][0], sgs[k][1]], [scs[k], scs[k]], color='darkgreen')
+
+                plt.title(f'Class {i+1} Segments')
+                plt.xlabel('Temporal')
+                plt.ylabel('Scores')
+
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
+                plt.savefig(plot_filename)
+
+                # Close the plot to free up resources
+                plt.close()
+                '''
+                ########################
 
         # cat along the FPN levels (F N_i, C)
         segs_all, scores_all, cls_idxs_all = [

@@ -1,8 +1,9 @@
 dataset_name: thumos
 train_split: [ 'validation' ]
 val_split: [ 'test' ]
+model_name: 'PseudoFormer'
 dataset: {
-  json_file: /data0/lixunsong/liuyangcen/CVPR2025/thumos14_pseudo_top1.json,
+  json_file: /data0/lixunsong/Datasets/thumos/annotations/thumos14.json,
   feat_folder: /data0/lixunsong/Datasets/thumos/i3d_features,
   file_prefix: ~,
   file_ext: .npy,

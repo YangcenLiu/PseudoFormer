@@ -65,6 +65,16 @@ def main(args):
     train_loader = make_data_loader(
         train_dataset, True, rng_generator, **cfg['loader'])
 
+    """create validation dataset / dataloader"""
+    val_dataset = make_dataset(
+        cfg['dataset_name'], False, cfg['val_split'], **cfg['dataset']
+    )
+    # set bs = 1, and disable shuffle
+    val_loader = make_data_loader(
+        val_dataset, False, None, 1, cfg['loader']['num_workers']
+    )
+    val_db_vars = val_dataset.get_attributes()
+
     """3. create model, optimizer, and scheduler"""
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
@@ -115,6 +125,7 @@ def main(args):
         'early_stop_epochs',
         cfg['opt']['epochs'] + cfg['opt']['warmup_epochs']
     )
+    max_det_eval = None # 最好的ckpt结果
     for epoch in range(args.start_epoch, max_epochs):
         # train for one epoch
         train_one_epoch(
@@ -127,6 +138,25 @@ def main(args):
             clip_grad_l2norm=cfg['train_cfg']['clip_grad_l2norm'],
             print_freq=args.print_freq
         )
+
+        # validation ckpt for the best
+        if (
+            (epoch == max_epochs - 1) or
+                (
+                        (args.val_freq > 0) and
+                        (epoch % args.val_freq == 0) and
+                        (epoch > 0)
+                )
+                
+        ):
+            det_eval = ANETdetection(
+                val_dataset.json_file,
+                val_dataset.split[0],
+                tiou_thresholds=val_db_vars['tiou_thresholds'],
+            )
+
+            if True:
+                max_det_eval = det_eval
 
         # save ckpt once in a while
         if (
@@ -151,6 +181,8 @@ def main(args):
                 file_folder=ckpt_folder,
                 file_name='epoch_{:03d}.pth.tar'.format(epoch)
             )
+    
+    print("best results: ", max_det_map)
 
     print("All done!")
     return
