@@ -2,38 +2,54 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+import json
+import numpy as np
 
 from .blocks import MaskedConv1D, Scale, LayerNorm
 from .losses import ctr_diou_loss_1d, sigmoid_focal_loss, ctr_giou_loss_1d
 from .models import register_meta_arch, make_backbone, make_neck, make_generator
 from ..utils import batched_nms
+from ..utils.edl_loss import EvidenceLoss
+from ..utils.edl_loss import relu_evidence, exp_evidence, softplus_evidence
 
 
 class BWA_fusion_dropout_feat(torch.nn.Module): # CO2-Net标准结构
     def __init__(self, n_feature, n_class):
         super().__init__()
         embed_dim = 1024
-        self.bit_wise_attn = nn.Sequential(
-            nn.Conv1d(n_feature, embed_dim, (3,), padding=1), nn.LeakyReLU(0.2), nn.Dropout(0.5))
-        self.channel_conv = nn.Sequential(
-            nn.Conv1d(n_feature, embed_dim, (3,), padding=1), nn.LeakyReLU(0.2), nn.Dropout(0.5))
-        self.attention = nn.Sequential(nn.Conv1d(embed_dim, 512, (3,), padding=1),
-                                       nn.LeakyReLU(0.2),
-                                       nn.Dropout(0.5),
-                                       nn.Conv1d(512, 512, (3,), padding=1),
-                                       nn.LeakyReLU(0.2),
-                                       nn.Conv1d(512, 1, (1,)),
-                                       nn.Dropout(0.5),
-                                       nn.Sigmoid())
+        self.bit_wise_attn = MaskedConv1D(n_feature, embed_dim, 3, padding=1) # nn.Conv1d(n_feature, embed_dim, (3,), padding=1) , nn.LeakyReLU(0.2), nn.Dropout(0.5)
+        self.channel_conv = MaskedConv1D(n_feature, embed_dim, 3, padding=1) # nn.Conv1d(n_feature, embed_dim, (3,), padding=1), nn.LeakyReLU(0.2), nn.Dropout(0.5)
+        self.attention = nn.ModuleList([MaskedConv1D(embed_dim, 512, 3, padding=1), MaskedConv1D(512, 512, 3, padding=1), MaskedConv1D(512, 1, 1)])
+        # nn.Conv1d(embed_dim, 512, (3,), padding=1), nn.LeakyReLU(0.2), nn.Dropout(0.5), nn.Conv1d(512, 512, (3,), padding=1), nn.LeakyReLU(0.2), 
+        # nn.Conv1d(512, 1, (1,)), nn.Dropout(0.5), nn.Sigmoid()
+
+        self.leaklyrelu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(0.5)
+        self.sigmoid = nn.Sigmoid()
         self.channel_avg = nn.AdaptiveAvgPool1d(1)
 
-    def forward(self, vfeat, ffeat, is_training=False):
+    def forward(self, vfeat, ffeat, batched_masks, is_training=False):
         channelfeat = self.channel_avg(vfeat)
-        channel_attn = self.channel_conv(channelfeat)
-        bit_wise_attn = self.bit_wise_attn(ffeat)
+        channel_attn = self.channel_conv_forward(channelfeat, batched_masks)
+        bit_wise_attn = self.bit_wise_attn_forward(ffeat, batched_masks)
         filter_feat = torch.sigmoid(bit_wise_attn * channel_attn) * vfeat
-        x_atn = self.attention(filter_feat)
+        x_atn = self.attention_forward(filter_feat, batched_masks) * batched_masks
         return x_atn, filter_feat
+    
+    def channel_conv_forward(self, channelfeat, batched_masks):
+        feat0, _ = self.channel_conv(channelfeat, batched_masks)
+        return self.dropout(self.leaklyrelu(feat0))
+    
+    def bit_wise_attn_forward(self, ffeat, batched_masks):
+        feat0, _ = self.bit_wise_attn(ffeat, batched_masks)
+        return self.dropout(self.leaklyrelu(feat0))
+    
+    def attention_forward(self, filter_feat, batched_masks):
+        feat0, _ = self.attention[0](filter_feat, batched_masks)
+        feat1 = self.dropout(self.leaklyrelu(feat0))
+        feat2, _ = self.attention[1](feat1, batched_masks)
+        feat3, _ = self.attention[2](self.leaklyrelu(feat2), batched_masks)
+        return self.sigmoid(self.dropout(feat3))
 
 class ClsHead(nn.Module):
     """
@@ -52,7 +68,6 @@ class ClsHead(nn.Module):
             with_ln=False,
             empty_cls=[],
             detach_feat=False,
-            with_sigmoid=False, # 是否最终有sigmoid激活值
     ):
         super().__init__()
         self.act = act_layer()
@@ -101,10 +116,6 @@ class ClsHead(nn.Module):
             bias_value = -(math.log((1 - 1e-6) / 1e-6))
             for idx in empty_cls:
                 torch.nn.init.constant_(self.cls_head.conv.bias[idx], bias_value)
-        
-        self.with_sigmoid = with_sigmoid
-        if self.with_sigmoid:
-            self.sigmoid = nn.Sigmoid()
 
     def forward(self, fpn_feats, fpn_masks):
         assert len(fpn_feats) == len(fpn_masks)
@@ -120,8 +131,6 @@ class ClsHead(nn.Module):
                 cur_out, _ = self.head[idx](cur_out, cur_mask)
                 cur_out = self.act(self.norm[idx](cur_out))
             cur_logits, _ = self.cls_head(cur_out, cur_mask)
-            if self.with_sigmoid: # 是否有sigmoid重分布
-                cur_logits = self.sigmoid(cur_logits)
             out_logits += (cur_logits,)
 
         # fpn_masks remains the same
@@ -445,7 +454,6 @@ class TriDet(nn.Module):
 
 
         #############################################
-        import json
         with open("/data0/lixunsong/Datasets/thumos/annotations/thumos14.json") as f:
             self.gt = json.load(f)
             maps = {3:3,10:10,11:11,12:12,13:13,14:14,15:15,18:18} # {3:29,10:65,11:70,12:79,13:86,14:127,15:153,18:41}
@@ -849,6 +857,13 @@ class TriDet(nn.Module):
         return {'cls_loss': cls_loss,
                 'reg_loss': reg_loss,
                 'final_loss': final_loss}
+    
+
+    def pseudo_proposal(
+        self,
+    ):
+        # to generate pseudo proposals with the CAS
+        pass
 
     @torch.no_grad()
     def inference(
@@ -895,12 +910,14 @@ class TriDet(nn.Module):
             )
 
             #############################################
-            self.visualize_single_video(
+            '''
+            results_per_vid = self.visualize_single_video(
                 points, fpn_masks_per_vid,
                 cls_logits_per_vid, offsets_per_vid,
                 lb_logits_per_vid, rb_logits_per_vid,
                 vlen, vidx
             )
+            '''
             #############################################
 
             # pass through video meta info
@@ -1171,7 +1188,7 @@ class TriDet(nn.Module):
                 data_for_class_i = cls_output[mask_i][:,i].cpu()
 
                 ######################## cas
-                plt.figure()
+                plt.figure(figsize=(15,5))
                 has = False
                 for seg in gt["annotations"]:
                     if seg["label_id"] == i+1:
@@ -1182,7 +1199,22 @@ class TriDet(nn.Module):
                 if has == False:
                     plt.close()
                     continue
-                plt.plot(np.array(data_for_class_i))
+                # plt.plot(np.array(data_for_class_i),color="#1f77b4") # 画CAS
+
+                ####################### 加proposal
+                st = np.array(seg_left.cpu()) * (0.5) ** tot
+                ed = np.array(seg_right.cpu()) * (0.5) ** tot
+                sc = np.array(data_for_class_i)
+                for tt in range(0, min(len(sc), len(st))):
+                    plt.plot(np.linspace(st[tt],ed[tt],2), np.array([sc[int(pt_idxs[tt])], sc[int(pt_idxs[tt])]]), color="green")
+                # print(seg_left[mask_i].size())
+                # print(seg_right[mask_i].size())
+                plt.plot(sc,color="#1f77b4")
+                
+                #######################
+
+
+
                 plt.title(f'Class {i+1} Scale {tot}')
                 plt.xlabel('Temporal')
                 plt.ylabel('Values')
@@ -1194,6 +1226,64 @@ class TriDet(nn.Module):
 
                 # Close the plot to free up resources
                 plt.close()
+
+                ########################
+
+                ######################## segments
+                '''
+                plt.figure()
+                for seg in gt["annotations"]:
+                    if seg["label_id"] == i+1:
+                        x1 = seg["segment"][0]/gt["duration"]*real_l
+                        x2 = seg["segment"][1]/gt["duration"]*real_l
+                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
+                selected = cls_idxs_all[tot]==(i+1)
+                # no prediction
+
+                sgs = segs_all[tot][selected].cpu()
+                scs = scores_all[tot][selected].cpu()
+
+                combined = list(zip(sgs, scs))
+
+                # Sort the combined list based on the values in scs in descending order
+                combined.sort(key=lambda x: x[1], reverse=True)
+
+                # Unzip the sorted list back into separate sgs and scs lists
+                if len(combined) == 0:
+                    plt.title(f'Class {i+1} Segments')
+                    plt.xlabel('Temporal')
+                    plt.ylabel('Scores')
+
+                    plt.tight_layout()
+                    # Save the plot to the specified path
+                    plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
+                    plt.savefig(plot_filename)
+
+                    # Close the plot to free up resources
+                    plt.close()
+                    continue
+                
+                sgs, scs = zip(*combined)
+
+                sgs = list(sgs)
+                scs = list(scs)
+
+                # Plot line segments
+                for k in range(min(len(sgs),30)):
+                    plt.plot([sgs[k][0], sgs[k][1]], [scs[k], scs[k]], color='darkgreen')
+
+                plt.title(f'Class {i+1} Segments')
+                plt.xlabel('Temporal')
+                plt.ylabel('Scores')
+
+                plt.tight_layout()
+                # Save the plot to the specified path
+                plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
+                plt.savefig(plot_filename)
+
+                # Close the plot to free up resources
+                plt.close()
+                '''
                 ########################
 
                 '''
@@ -1286,62 +1376,7 @@ class TriDet(nn.Module):
 
                 # Close the plot to free up resources
                 plt.close()
-
-                ######################## segments
-                plt.figure()
-                for seg in gt["annotations"]:
-                    if seg["label_id"] == i+1:
-                        x1 = seg["segment"][0]/gt["duration"]*real_l
-                        x2 = seg["segment"][1]/gt["duration"]*real_l
-                        plt.axvspan(x1, x2, facecolor='red', alpha=0.3)
-                selected = cls_idxs_all[tot]==(i+1)
-                # no prediction
-
-                sgs = segs_all[tot][selected].cpu()
-                scs = scores_all[tot][selected].cpu()
-
-                combined = list(zip(sgs, scs))
-
-                # Sort the combined list based on the values in scs in descending order
-                combined.sort(key=lambda x: x[1], reverse=True)
-
-                # Unzip the sorted list back into separate sgs and scs lists
-                if len(combined) == 0:
-                    plt.title(f'Class {i+1} Segments')
-                    plt.xlabel('Temporal')
-                    plt.ylabel('Scores')
-
-                    plt.tight_layout()
-                    # Save the plot to the specified path
-                    plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
-                    plt.savefig(plot_filename)
-
-                    # Close the plot to free up resources
-                    plt.close()
-                    continue
-                
-                sgs, scs = zip(*combined)
-
-                sgs = list(sgs)
-                scs = list(scs)
-
-                # Plot line segments
-                for k in range(min(len(sgs),30)):
-                    plt.plot([sgs[k][0], sgs[k][1]], [scs[k], scs[k]], color='darkgreen')
-
-                plt.title(f'Class {i+1} Segments')
-                plt.xlabel('Temporal')
-                plt.ylabel('Scores')
-
-                plt.tight_layout()
-                # Save the plot to the specified path
-                plot_filename = os.path.join(dir_path, f'seg_{i+1}.png')
-                plt.savefig(plot_filename)
-
-                # Close the plot to free up resources
-                plt.close()
                 '''
-                ########################
 
         # cat along the FPN levels (F N_i, C)
         segs_all, scores_all, cls_idxs_all = [
@@ -2251,18 +2286,54 @@ class PseudoFormer(nn.Module):
             }
         )
 
-        # classfication and regerssion heads
-        self.cas_head = BWA_fusion_dropout_feat( # 这里我们把cls_head和CAS值直接进行匹配 CAS的原版最终是一个sigmoid形 这里是一个conv1d
-            head_dim, self.num_classes, # 这里多加了一个背景类
+        ####################################################
+        # Weakly-supervised Methods
+        self.n_feature = 2048
+        self.dropout_ratio = 0.7
+        self.vAttn = BWA_fusion_dropout_feat( # 这里我们把cls_head和CAS值直接进行匹配 CAS的原版最终是一个sigmoid形 这里是一个conv1d
+            1024, self.num_classes,
         )
+        self.fAttn = BWA_fusion_dropout_feat( # 这里我们把cls_head和CAS值直接进行匹配 CAS的原版最终是一个sigmoid形 这里是一个conv1d
+            1024, self.num_classes,
+        )
+        self.fusion = MaskedConv1D(self.n_feature, self.n_feature, 1, padding=0)
+        '''
+        nn.Sequential(
+            nn.Conv1d(self.n_feature, self.n_feature, (1,), padding=0),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(self.dropout_ratio)
+        )
+        '''
+
+        self.classifier = nn.ModuleList([MaskedConv1D(self.n_feature, self.n_feature, 3, padding=1), MaskedConv1D(self.n_feature, self.num_classes + 1, 1)])
+        '''
+        nn.Sequential(
+            nn.Dropout(self.dropout_ratio),
+            nn.Conv1d(self.n_feature, self.n_feature, (3,), padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(self.dropout_ratio),
+            nn.Conv1d(self.n_feature, self.num_classes + 1, (1,))
+        )
+        '''
+
+        self.leaklyrelu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(self.dropout_ratio)
+
+        _kernel = 13
+        self.apool = nn.AvgPool1d(_kernel, 1, padding=_kernel // 2, count_include_pad=True) \
+            if _kernel is not None else nn.Identity()
+        ######################################################
+
+        ######################################################
+        # Fully-supervised Methods
+        # classfication and regerssion heads
         self.cls_head = ClsHead( # 这是原来的cls_head 我现在改了
-            fpn_dim, head_dim, self.num_classes+1,
+            fpn_dim, head_dim, self.num_classes,
             kernel_size=head_kernel_size,
             prior_prob=self.train_cls_prior_prob,
             with_ln=head_with_ln,
             num_layers=head_num_layers,
             empty_cls=train_cfg['head_empty_cls'],
-            with_sigmoid=True,
         )
 
         if use_trident_head:
@@ -2305,6 +2376,7 @@ class PseudoFormer(nn.Module):
         # useful for small mini-batch training
         self.loss_normalizer = train_cfg['init_loss_norm']
         self.loss_normalizer_momentum = 0.9
+        ######################################################
 
 
     @property
@@ -2357,9 +2429,36 @@ class PseudoFormer(nn.Module):
             decoded_offset_right = torch.matmul(pred_right_dis, right_range_idx)
             return torch.cat([decoded_offset_left, decoded_offset_right], dim=-1)
 
-    def forward(self, video_list):
+    def forward(self, video_list, itr=-1, max_itr=-1):
         # batch the video list into feats (B, C, T) and masks (B, 1, T) (True, False)
         batched_inputs, batched_masks = self.preprocessing(video_list)
+
+        #########################################################
+        # Weakly-supervised Method
+
+        feat = batched_inputs # (B, C, T)
+        v_atn, vfeat = self.vAttn(feat[:, :1024, :], feat[:, 1024:, :], batched_masks)
+        f_atn, ffeat = self.fAttn(feat[:, 1024:, :], feat[:, :1024, :], batched_masks)
+
+        x_atn = (f_atn + v_atn) / 2
+        nfeat = torch.cat((vfeat, ffeat), 1)
+        nfeat, _ = self.fusion(nfeat, batched_masks) # (B, C, T)
+        nfeat =  self.dropout(self.leaklyrelu(nfeat)) # (B, C, T)
+        x_cls, _ = self.classifier[0](nfeat, batched_masks) # (B, cls, T)
+        x_cls, _ = self.classifier[1](self.dropout(self.leaklyrelu(x_cls)), batched_masks) # (B, cls, T)
+
+        weak_outputs = {'feat': nfeat.transpose(-1, -2), # (B, T, C)
+                   'cas': x_cls.transpose(-1, -2), # (B, T, cls)
+                   'attn': x_atn.transpose(-1, -2), # (B, T, 1)
+                   'v_atn': v_atn.transpose(-1, -2), # (B, T, C)
+                   'f_atn': f_atn.transpose(-1, -2), # (B, T, C)
+                   'mask': batched_masks.transpose(-1, -2), # (B, T, 1)
+                   }
+        ########################################################
+
+
+        #########################################################
+        # Fully-supervised Method
 
         # forward the network (backbone -> neck -> heads)
         # fpn_feats: (B, C, T) (B, C, T//2) (B, C, T//4) (B, C, T//8) (B, C, T//32) (B, C, T//64)
@@ -2373,7 +2472,7 @@ class PseudoFormer(nn.Module):
         # points: (B, T, 4) (B, T//2, 4) ......
         points = self.point_generator(fpn_feats)
 
-        # out_cls: List[B, #cls + 1, T_i]
+        # out_cls: List[B, #cls, T_i]
         out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
 
         if self.use_trident_head:
@@ -2386,9 +2485,6 @@ class PseudoFormer(nn.Module):
         # out_offset: List[B, 2, T_i]
         out_offsets = self.reg_head(fpn_feats, fpn_masks)
 
-        fpn_id = 0
-        attention, cas = self.cas_head(feats[fpn_id:fpn_id+1], fpn_masks[fpn_id:fpn_id+1]) # 只使用一个层
-   
         # permute the outputs
         # out_cls: F List[B, #cls, T_i] -> F List[B, T_i, #cls]
         out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
@@ -2397,6 +2493,8 @@ class PseudoFormer(nn.Module):
         # fpn_masks: F list[B, 1, T_i] -> F List[B, T_i]
         fpn_masks = [x.squeeze(1) for x in fpn_masks]
 
+        ########################################################
+
         # return loss during training
         if self.training:
             # generate segment/lable List[N x 2] / List[N] with length = B
@@ -2404,12 +2502,24 @@ class PseudoFormer(nn.Module):
             assert video_list[0]['labels'] is not None, "GT action labels does not exist"
             gt_segments = [x['segments'].to(self.device) for x in video_list]
             gt_labels = [x['labels'].to(self.device) for x in video_list]
+            gt_video_labels = torch.zeros((len(video_list),self.num_classes)).to(self.device) # video-level label
+            for b in range(len(gt_labels)):
+                for l in gt_labels[b]:
+                    gt_video_labels[b][l] = 1
 
             # compute the gt labels for cls & reg
             # list of prediction targets
             gt_cls_labels, gt_offsets = self.label_points(
                 points, gt_segments, gt_labels)
 
+            weakly_losses = self.weakly_losses(  
+                weak_outputs,
+                gt_video_labels,
+                batched_masks,
+                itr=itr,
+                max_itr=max_itr)
+            
+            '''
             # compute the loss and return
             losses = self.losses(
                 fpn_masks,
@@ -2417,14 +2527,10 @@ class PseudoFormer(nn.Module):
                 gt_cls_labels, gt_offsets,
                 out_lb_logits, out_rb_logits,
             ) # {'cls_loss': , 'reg_loss': , 'final_loss': }
+            '''
+            losses = weakly_losses
 
-            '''
-            weakly_losses = self.weakly_losses(
-                fpn_masks[fpn_id:fpn_id+1], 
-                cas,
-                gt_cls_labels)
             return losses
-            '''
 
         else:
             # decode the actions (sigmoid / stride, etc)
@@ -2435,20 +2541,50 @@ class PseudoFormer(nn.Module):
             )
             return results
     
-    def _multiply(self, x, atn, dim=-1, include_min=False):
+    def _multiply(self, x, atn, batched_masks, dim=-1, include_min=False):
         if include_min:
-            _min = x.min(dim=dim, keepdim=True)[0]
+            _min = x[batched_masks].min(dim=dim, keepdim=True)[0]
         else:
             _min = 0
-        return atn * (x - _min) + _min
+        return (atn * (x - _min) + _min) * batched_masks
     
-    def weakly_losses(self, fpn_masks, cas, labels, topk=7):
+    def weakly_losses(self, outputs, labels, batched_masks, itr=-1, max_itr=-1, topk=7):
+
+        alpha1 = 0.8
+        alpha2 = 0.4
+        alpha3 = 1.0
+        alpha4 = 1.0
+        rat_atn = 9
+        amplitude = 0.7
+        alpha_edl = 1.0
+        alpha_uct_guide = 0.4
+
         feat, element_logits, element_atn = outputs['feat'], outputs['cas'], outputs['attn']
         v_atn = outputs['v_atn']
         f_atn = outputs['f_atn']
         mutual_loss = 0.5 * F.mse_loss(v_atn, f_atn.detach()) + 0.5 * F.mse_loss(f_atn, v_atn.detach())
 
         element_logits_supp = self._multiply(element_logits, element_atn, include_min=True)
+
+        edl_loss = self.edl_loss(element_logits_supp,
+                                 element_atn,
+                                 labels,
+                                 rat=rat_atn,
+                                 n_class=self.num_classes,
+                                 epoch=itr,
+                                 total_epoch=max_itr,
+                                 )
+
+        uct_guide_loss = self.uct_guide_loss(element_logits,
+                                             element_logits_supp,
+                                             element_atn,
+                                             v_atn,
+                                             f_atn,
+                                             n_class=self.num_classes,
+                                             epoch=itr,
+                                             total_epoch=max_itr,
+                                             amplitude=amplitude,
+                                             )
 
         loss_mil_orig, _ = self.topkloss(element_logits,
                                          labels,
@@ -2461,7 +2597,7 @@ class PseudoFormer(nn.Module):
                                          is_back=False,
                                          rat=topk)
 
-        loss_3_supp_Contrastive = self.Contrastive(feat, element_logits_supp, labels, is_back=False)
+        # loss_3_supp_Contrastive = self.Contrastive(feat, element_logits_supp, labels, is_back=False)
 
         loss_norm = element_atn.mean()
         # guide loss
@@ -2478,24 +2614,105 @@ class PseudoFormer(nn.Module):
         f_loss_guide = (1 - f_atn -
                         element_logits.softmax(-1)[..., [-1]]).abs().mean()
 
-        total_loss = (
-                    loss_mil_orig.mean() + loss_mil_supp.mean() +
-                    args['opt'].alpha3 * loss_3_supp_Contrastive +
-                    args['opt'].alpha4 * mutual_loss +
-                    args['opt'].alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3 +
-                    args['opt'].alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3)
+
+        total_loss = loss_mil_orig.mean() + loss_mil_supp.mean() + alpha4 * mutual_loss + alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3 + alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3
+                     # alpha3 * loss_3_supp_Contrastive +
 
         loss_dict = {
             'loss_mil_orig': loss_mil_orig.mean(),
             'loss_mil_supp': loss_mil_supp.mean(),
-            'loss_supp_contrastive': args['opt'].alpha3 * loss_3_supp_Contrastive,
-            'mutual_loss': args['opt'].alpha4 * mutual_loss,
-            'norm_loss': args['opt'].alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3,
-            'guide_loss': args['opt'].alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3,
-            'total_loss': total_loss,
+            # 'loss_supp_contrastive': alpha3 * loss_3_supp_Contrastive,
+            'mutual_loss': alpha4 * mutual_loss,
+            'norm_loss': alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3,
+            'guide_loss': alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3,
+            'final_loss': total_loss,
         }
 
-        return total_loss, loss_dict
+        return loss_dict # , loss_dict
+    
+    def edl_loss(self,
+                 element_logits_supp,
+                 element_atn,
+                 labels,
+                 rat,
+                 n_class,
+                 epoch=0,
+                 total_epoch=5000,
+                 ):
+
+        k = max(1, int(element_logits_supp.shape[-2] // rat))
+
+        atn_values, atn_idx = torch.topk(
+            element_atn,
+            k=k,
+            dim=1
+        )
+        atn_idx_expand = atn_idx.expand([-1, -1, n_class + 1])
+        topk_element_logits = torch.gather(element_logits_supp, 1, atn_idx_expand)[:, :, :-1]
+        video_logits = topk_element_logits.mean(dim=1)
+
+        edl_loss = EvidenceLoss(
+            num_classes=n_class,
+            evidence='exp',
+            loss_type='log',
+            with_kldiv=False,
+            with_avuloss=False,
+            disentangle=False,
+            annealing_method='exp')
+
+        edl_results = edl_loss(
+            output=video_logits,
+            target=labels,
+            epoch=epoch,
+            total_epoch=total_epoch
+        )
+
+        edl_loss = edl_results['loss_cls'].mean()
+
+        return edl_loss
+    
+    def course_function(self, epoch, total_epoch, total_snippet_num, amplitude):
+
+        idx = torch.arange(total_snippet_num)
+        theta = 2 * (idx + 0.5) / total_snippet_num - 1
+        delta = - 2 * epoch / total_epoch + 1
+        curve = amplitude * torch.tanh(theta * delta) + 1
+
+        return curve
+
+    def uct_guide_loss(self,
+                       element_logits,
+                       element_logits_supp,
+                       element_atn,
+                       v_atn,
+                       f_atn,
+                       n_class,
+                       epoch,
+                       total_epoch,
+                       amplitude):
+
+        evidence = exp_evidence(element_logits_supp)
+        alpha = evidence + 1
+        S = torch.sum(alpha, dim=-1)
+        snippet_uct = n_class / S
+
+        total_snippet_num = element_logits.shape[1]
+        curve = self.course_function(epoch, total_epoch, total_snippet_num, amplitude).to(self.device)
+
+        loss_guide = (1 - element_atn - element_logits.softmax(-1)[..., [-1]]).abs().squeeze()
+
+        v_loss_guide = (1 - v_atn - element_logits.softmax(-1)[..., [-1]]).abs().squeeze()
+
+        f_loss_guide = (1 - f_atn - element_logits.softmax(-1)[..., [-1]]).abs().squeeze()
+
+        total_loss_guide = (loss_guide + v_loss_guide + f_loss_guide) / 3
+
+        _, uct_indices = torch.sort(snippet_uct, dim=1)
+        sorted_curve = torch.gather(curve.repeat(10, 1), 1, uct_indices)
+
+        uct_guide_loss = torch.mul(sorted_curve, total_loss_guide).mean()
+
+        return uct_guide_loss
 
     
     def topkloss(self,
@@ -2604,7 +2821,7 @@ class PseudoFormer(nn.Module):
 
         # push to device
         batched_inputs = batched_inputs.to(self.device)
-        batched_masks = batched_masks.unsqueeze(1).to(self.device)
+        batched_masks = batched_masks.unsqueeze(1).to(self.device).detach()
 
         return batched_inputs, batched_masks
 
@@ -2621,7 +2838,7 @@ class PseudoFormer(nn.Module):
             cls_targets, reg_targets = self.label_points_single_video(
                 concat_points, gt_segment, gt_label
             )
-            # append to list (len = # images, each of size FT x C+1)
+            # append to list (len = # images, each of size FT x C)
             gt_cls.append(cls_targets)
             gt_offset.append(reg_targets)
 
@@ -2718,8 +2935,8 @@ class PseudoFormer(nn.Module):
             gt_cls_labels, gt_offsets,
             out_start, out_end,
     ):
-        # fpn_masks, out_*: F (List) [B, T_i, C+1]
-        # gt_* : B (list) [F T, C+1]
+        # fpn_masks, out_*: F (List) [B, T_i, C]
+        # gt_* : B (list) [F T, C+]
         # fpn_masks -> (B, FT)
         valid_mask = torch.cat(fpn_masks, dim=1)
 
@@ -2789,7 +3006,7 @@ class PseudoFormer(nn.Module):
                 gt_offsets,
                 reduction='none'
             )
-            rated_mask = gt_target > self.train_label_smoothing / (self.num_classes + 1) # 这里得加2了
+            rated_mask = gt_target > self.train_label_smoothing / (self.num_classes + 1)
             cls_loss[rated_mask] *= (1 - iou_rate) ** self.iou_weight_power
 
         cls_loss = cls_loss.sum()

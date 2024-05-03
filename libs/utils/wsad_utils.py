@@ -238,13 +238,13 @@ def get_proposal_oic_2(tList,
                        lambda_=0.25,
                        gamma=0.2,
                        loss_type="oic"): # 一般用的这个2号
-    t_factor = (16 * v_len) / (scale * num_segments * sampling_frames)
+    # t_factor = (16 * v_len) / (scale * num_segments * sampling_frames)
     temp = []
     for i in range(len(tList)):
         c_temp = []
         temp_list = np.array(tList[i])[0]
         if temp_list.any():
-            grouped_temp_list = grouping(temp_list)
+            grouped_temp_list = grouping(temp_list) # grouping: np.split(arr, np.where(np.diff(arr) != 1)[0] + 1)
             for j in range(len(grouped_temp_list)):
                 inner_score = np.mean(wtcam[grouped_temp_list[j], i, 0])
 
@@ -356,14 +356,14 @@ def multi_scale_multiple_threshold_hamnet(vid_name, data_dict):
                 seg_list.append(pos)
 
             proposals = get_proposal_oic_2(seg_list,
-                                                cas_temp,
-                                                pred_vid_score,
-                                                pred,
-                                                args.scale,
-                                                num_segments,
-                                                args.feature_fps,
-                                                num_segments,
-                                                gamma=args.gamma_oic)
+                                            cas_temp,
+                                            pred_vid_score,
+                                            pred,
+                                            args.scale,
+                                            num_segments,
+                                            args.feature_fps,
+                                            num_segments,
+                                            gamma=args.gamma_oic)
 
             for j in range(len(proposals)):
 

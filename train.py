@@ -136,15 +136,16 @@ def main(args):
             epoch,
             model_ema=model_ema,
             clip_grad_l2norm=cfg['train_cfg']['clip_grad_l2norm'],
-            print_freq=args.print_freq
+            print_freq=args.print_freq,
+            max_itr=max_epochs,
         )
 
         # validation ckpt for the best
         if (
             (epoch == max_epochs - 1) or
                 (
-                        (args.val_freq > 0) and
-                        (epoch % args.val_freq == 0) and
+                        (cfg['train_cfg']['val_freq'] > 0) and
+                        (epoch % cfg['train_cfg']['val_freq'] == 0) and
                         (epoch > 0)
                 )
                 

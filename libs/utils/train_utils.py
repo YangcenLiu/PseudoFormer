@@ -262,7 +262,8 @@ def train_one_epoch(
         curr_epoch,
         model_ema=None,
         clip_grad_l2norm=-1,
-        print_freq=20
+        print_freq=20,
+        max_itr=-11
 ):
     """Training the model for one epoch"""
     # set up meters
@@ -280,7 +281,7 @@ def train_one_epoch(
         # zero out optim
         optimizer.zero_grad(set_to_none=True)
         # forward / backward the model
-        losses = model(video_list)
+        losses = model(video_list, itr=curr_epoch, max_itr=max_itr)
         losses['final_loss'].backward()
         # gradient cliping (to stabilize training if necessary)
         if clip_grad_l2norm > 0.0:
@@ -367,6 +368,14 @@ def valid_one_epoch(
         'score': []
     }
 
+    '''
+    with open ("class_mapping/thumos_class_mapping.json", "r") as f:
+        cls_mapping_json = json.load(f)
+        id2name = {int(v): k for k, v in cls_mapping_json.items()}
+
+    results_json = {"results": {}}
+    '''
+
     # loop over validation set
     start = time.time()
     for iter_idx, video_list in enumerate(val_loader, 0):
@@ -386,6 +395,18 @@ def valid_one_epoch(
                     results['t-end'].append(output[vid_idx]['segments'][:, 1])
                     results['label'].append(output[vid_idx]['labels'])
                     results['score'].append(output[vid_idx]['scores'])
+                
+                '''
+                result = output[vid_idx]
+                segment = []
+                for tot in range(len(result["segments"])):
+                    temp = {"label": id2name[int(result["labels"][tot])], 
+                    "score": float(result["scores"][tot]), 
+                    "segment": [float(result["segments"][tot][0]),float(result["segments"][tot][1])]
+                    }
+                    segment.append(temp)
+                results_json["results"][result["video_id"]] = segment
+                '''
 
         # printing
         if (iter_idx != 0) and iter_idx % (print_freq) == 0:
@@ -398,6 +419,12 @@ def valid_one_epoch(
             print('Test: [{0:05d}/{1:05d}]\t'
                   'Time {batch_time.val:.2f} ({batch_time.avg:.2f})'.format(
                 iter_idx, len(val_loader), batch_time=batch_time))
+
+    '''
+    with open("/data0/lixunsong/liuyangcen/TriDet/TriDet_proposal.json", "w") as f:
+        json.dump(results_json, f)
+    exit()
+    '''
 
     # gather all stats and evaluate
     results['t-start'] = torch.cat(results['t-start']).numpy()

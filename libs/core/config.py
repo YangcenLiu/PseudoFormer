@@ -115,6 +115,8 @@ DEFAULTS = {
         "droppath": 0.1,
         # if to use label smoothing (>0.0)
         "label_smoothing": 0.0,
+        # the frequency for validatino
+        "val_freq": 5,
     },
     "test_cfg": {
         "pre_nms_thresh": 0.001,

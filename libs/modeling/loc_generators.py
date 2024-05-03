@@ -49,7 +49,7 @@ class PointGenerator(nn.Module):
         assert max_seq_len % scale_factor ** (fpn_levels - 1) == 0
 
         # save params
-        self.max_seq_len = max_seq_len * 80 # 这里每次都要重新调整
+        self.max_seq_len = max_seq_len
         self.fpn_levels = fpn_levels
         self.scale_factor = scale_factor
         self.regression_range = regression_range
@@ -110,7 +110,7 @@ class AformerPointGenerator(nn.Module):
         assert len(regression_range) == fpn_levels
 
         # save params
-        self.max_seq_len = max_seq_len * 80 # 这里每次都要重新调整
+        self.max_seq_len = max_seq_len
         self.fpn_levels = fpn_levels
         self.fpn_strides = fpn_strides
         self.regression_range = regression_range

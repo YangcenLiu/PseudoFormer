@@ -1,0 +1,22 @@
+{
+    "BaseballPitch": 0,
+    "BasketballDunk": 1,
+    "Billiards": 2,
+    "CleanAndJerk": 3,
+    "CliffDiving": 4,
+    "CricketBowling": 5,
+    "CricketShot": 6,
+    "Diving": 7,
+    "FrisbeeCatch": 8,
+    "GolfSwing": 9,
+    "HammerThrow": 10,
+    "HighJump": 11,
+    "JavelinThrow": 12,
+    "LongJump": 13,
+    "PoleVault": 14,
+    "Shotput": 15,
+    "SoccerPenalty": 16,
+    "TennisSwing": 17,
+    "ThrowDiscus": 18,
+    "VolleyballSpiking": 19
+}
