@@ -11,6 +11,7 @@ from .models import register_meta_arch, make_backbone, make_neck, make_generator
 from ..utils import batched_nms
 from ..utils.edl_loss import EvidenceLoss
 from ..utils.edl_loss import relu_evidence, exp_evidence, softplus_evidence
+from ..utils.wsad_utils import multiple_threshold_hamnet
 
 
 class BWA_fusion_dropout_feat(torch.nn.Module): # CO2-Net标准结构
@@ -32,7 +33,7 @@ class BWA_fusion_dropout_feat(torch.nn.Module): # CO2-Net标准结构
         channelfeat = self.channel_avg(vfeat)
         channel_attn = self.channel_conv_forward(channelfeat, batched_masks)
         bit_wise_attn = self.bit_wise_attn_forward(ffeat, batched_masks)
-        filter_feat = torch.sigmoid(bit_wise_attn * channel_attn) * vfeat
+        filter_feat = torch.sigmoid(bit_wise_attn * channel_attn) * vfeat * batched_masks
         x_atn = self.attention_forward(filter_feat, batched_masks) * batched_masks
         return x_atn, filter_feat
     
@@ -857,13 +858,7 @@ class TriDet(nn.Module):
         return {'cls_loss': cls_loss,
                 'reg_loss': reg_loss,
                 'final_loss': final_loss}
-    
 
-    def pseudo_proposal(
-        self,
-    ):
-        # to generate pseudo proposals with the CAS
-        pass
 
     @torch.no_grad()
     def inference(
@@ -2515,7 +2510,6 @@ class PseudoFormer(nn.Module):
             weakly_losses = self.weakly_losses(  
                 weak_outputs,
                 gt_video_labels,
-                batched_masks,
                 itr=itr,
                 max_itr=max_itr)
             
@@ -2528,17 +2522,25 @@ class PseudoFormer(nn.Module):
                 out_lb_logits, out_rb_logits,
             ) # {'cls_loss': , 'reg_loss': , 'final_loss': }
             '''
+
             losses = weakly_losses
 
             return losses
 
         else:
-            # decode the actions (sigmoid / stride, etc)
+            # for weakly-supervised method
+            results = self.pseudo_proposal(
+                video_list, weak_outputs,
+
+            )
+            '''
+            # for fully-supervised method: decode the actions (sigmoid / stride, etc)
             results = self.inference(
                 video_list, points, fpn_masks,
                 out_cls_logits, out_offsets,
                 out_lb_logits, out_rb_logits,
             )
+            '''
             return results
     
     def _multiply(self, x, atn, batched_masks, dim=-1, include_min=False):
@@ -2548,7 +2550,7 @@ class PseudoFormer(nn.Module):
             _min = 0
         return (atn * (x - _min) + _min) * batched_masks
     
-    def weakly_losses(self, outputs, labels, batched_masks, itr=-1, max_itr=-1, topk=7):
+    def weakly_losses(self, outputs, labels, itr=-1, max_itr=-1, topk=7):
 
         alpha1 = 0.8
         alpha2 = 0.4
@@ -2559,7 +2561,7 @@ class PseudoFormer(nn.Module):
         alpha_edl = 1.0
         alpha_uct_guide = 0.4
 
-        feat, element_logits, element_atn = outputs['feat'], outputs['cas'], outputs['attn']
+        feat, element_logits, element_atn, batched_masks = outputs['feat'], outputs['cas'], outputs['attn'], outputs['mask']
         v_atn = outputs['v_atn']
         f_atn = outputs['f_atn']
         mutual_loss = 0.5 * F.mse_loss(v_atn, f_atn.detach()) + 0.5 * F.mse_loss(f_atn, v_atn.detach())
@@ -2615,10 +2617,10 @@ class PseudoFormer(nn.Module):
                         element_logits.softmax(-1)[..., [-1]]).abs().mean()
 
 
-        total_loss = loss_mil_orig.mean() + loss_mil_supp.mean() + alpha4 * mutual_loss + alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3 + alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3
-                     # alpha3 * loss_3_supp_Contrastive +
+        total_loss = loss_mil_orig.mean() + loss_mil_supp.mean() + alpha4 * mutual_loss + alpha1 * (loss_norm + v_loss_norm + f_loss_norm) / 3 + alpha2 * (loss_guide + v_loss_guide + f_loss_guide) / 3 # + alpha3 * loss_3_supp_Contrastive
 
         loss_dict = {
+            'total_loss': total_loss,
             'loss_mil_orig': loss_mil_orig.mean(),
             'loss_mil_supp': loss_mil_supp.mean(),
             # 'loss_supp_contrastive': alpha3 * loss_3_supp_Contrastive,
@@ -3080,14 +3082,14 @@ class PseudoFormer(nn.Module):
             )
 
             #############################################
-            
+            '''
             self.visualize_single_video(
                 points, fpn_masks_per_vid,
                 cls_logits_per_vid, offsets_per_vid,
                 lb_logits_per_vid, rb_logits_per_vid,
                 vlen, vidx
             )
-            
+            '''
             #############################################
 
             # pass through video meta info
@@ -3101,6 +3103,50 @@ class PseudoFormer(nn.Module):
         # dict_keys(['segments', 'scores', 'labels', 'video_id', 'fps', 'duration', 'feat_stride', 'feat_num_frames'])
         # step 3: postprocssing
         results = self.postprocessing(results)
+
+        return results
+
+    @torch.no_grad()
+    def pseudo_proposal(
+        self,
+        video_list,
+        weakly_outputs
+    ):
+        # generate pseudo proposals from the weakly-supervised method
+        results = []
+
+        # 1: gather video meta information
+        vid_idxs = [x['video_id'] for x in video_list]
+        vid_fps = [x['fps'] for x in video_list]
+        vid_lens = [x['duration'] for x in video_list]
+        vid_ft_stride = [x['feat_stride'] for x in video_list]
+        vid_ft_nframes = [x['feat_num_frames'] for x in video_list]
+
+        # 2: inference on each single video and gather the results
+        # upto this point, all results use timestamps defined on feature grids
+        for idx, (vidx, fps, vlen, stride, nframes) in enumerate(
+                zip(vid_idxs, vid_fps, vid_lens, vid_ft_stride, vid_ft_nframes)
+        ):
+
+            # inference on a single video (should always be the case)
+            results_per_vid = multiple_threshold_hamnet(
+                vidx, weakly_outputs, fps
+            )
+
+            if results_per_vid == None: # 没有任何的预测结果
+                continue
+
+            # pass through video meta info
+            results_per_vid['video_id'] = vidx
+            results_per_vid['fps'] = fps
+            results_per_vid['duration'] = vlen
+            results_per_vid['feat_stride'] = stride
+            results_per_vid['feat_num_frames'] = nframes
+            results.append(results_per_vid)
+
+        # dict_keys(['segments', 'scores', 'labels', 'video_id', 'fps', 'duration', 'feat_stride', 'feat_num_frames'])
+        # step 3: postprocssing
+        results = self.postprocessing(results, nms=False)
 
         return results
 
@@ -3200,7 +3246,7 @@ class PseudoFormer(nn.Module):
         return results
 
     @torch.no_grad()
-    def postprocessing(self, results):
+    def postprocessing(self, results, nms=True):
         # input : list of dictionary items
         # (1) push to CPU; (2) NMS; (3) convert to actual time stamps
         processed_results = []
@@ -3216,7 +3262,7 @@ class PseudoFormer(nn.Module):
             segs = results_per_vid['segments'].detach().cpu()
             scores = results_per_vid['scores'].detach().cpu()
             labels = results_per_vid['labels'].detach().cpu()
-            if self.test_nms_method != 'none':
+            if self.test_nms_method != 'none' and nms==True:
                 # 2: batched nms (only implemented on CPU)
                 segs, scores, labels = batched_nms(
                     segs, scores, labels,

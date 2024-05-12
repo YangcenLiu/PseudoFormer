@@ -2,6 +2,7 @@
 
 echo "start training"
 # python train.py ./configs/thumos_i3d.yaml --output origin
+
 python train.py ./configs/thumos_i3d_pseudo.yaml --output pseudo
 
 

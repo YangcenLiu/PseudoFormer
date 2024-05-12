@@ -124,8 +124,8 @@ def main(args):
     max_epochs = cfg['opt'].get(
         'early_stop_epochs',
         cfg['opt']['epochs'] + cfg['opt']['warmup_epochs']
-    )
-    max_det_eval = None # 最好的ckpt结果
+    ) # 注意把max_epoch改回来
+    max_mAP = 0 # 最好的ckpt结果
     for epoch in range(args.start_epoch, max_epochs):
         # train for one epoch
         train_one_epoch(
@@ -156,9 +156,23 @@ def main(args):
                 tiou_thresholds=val_db_vars['tiou_thresholds'],
             )
 
-            if True:
-                max_det_eval = det_eval
+            mAP = valid_one_epoch(
+                val_loader,
+                model,
+                -1,
+                evaluator=det_eval,
+                output_file=None,
+                ext_score_file=cfg['test_cfg']['ext_score_file'],
+                tb_writer=None,
+                print_freq=args.print_freq
+            )
 
+            if mAP > max_mAP:
+                max_mAP = mAP
+            print("mAP: ", mAP*100, "% max_mAP: ", max_mAP*100, "%")
+
+
+        '''
         # save ckpt once in a while
         if (
                 (epoch == max_epochs - 1) or
@@ -182,8 +196,9 @@ def main(args):
                 file_folder=ckpt_folder,
                 file_name='epoch_{:03d}.pth.tar'.format(epoch)
             )
+            '''
     
-    print("best results: ", max_det_map)
+    # print("best results: ", max_det_map)
 
     print("All done!")
     return

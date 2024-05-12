@@ -30,13 +30,13 @@ model: {
   input_noise: 0.0005
 }
 opt: {
-  learning_rate: 0.0001,
-  warmup_epochs: 20,
-  epochs: 20,
-  weight_decay: 0.025,
+  learning_rate: 0.00005, # 0.0001,
+  warmup_epochs: 1, # 20,
+  epochs: 400, # 20,
+  weight_decay: 0.001 # 0.025,
 }
 loader: {
-  batch_size: 2,
+  batch_size: 10 # 2,
 }
 train_cfg: {
   init_loss_norm: 100,
@@ -44,6 +44,7 @@ train_cfg: {
   cls_prior_prob: 0.01,
   center_sample: radius,
   center_sample_radius: 1.5,
+  val_freq: 20,
 }
 # the inference on THUMOS is quite different from EPIC-kitchens
 # a major performance gain is achieved by fusing external classification scores
