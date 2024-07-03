@@ -1,0 +1,34 @@
+{
+    "10": {
+        "anet idx": "0",
+        "anet name": "Clean and jerk"
+    },
+    "29": {
+        "anet idx": "1",
+        "anet name": "Hammer throw"
+    },
+    "31": {
+        "anet idx": "2",
+        "anet name": "High jump"
+    },
+    "35": {
+        "anet idx": "3",
+        "anet name": "Javelin throw"
+    },
+    "38": {
+        "anet idx": "4",
+        "anet name": "Long jump"
+    },
+    "63": {
+        "anet idx": "5",
+        "anet name": "Pole vault"
+    },
+    "74": {
+        "anet idx": "6",
+        "anet name": "Shot put"
+    },
+    "15": {
+        "anet idx": "7",
+        "anet name": "Discus throw"
+    }
+}

@@ -1,0 +1,11 @@
+ckpt/
+*.log
+temp/
+outputs/
+
+6_model.sh
+eval_6.py
+train_6.py
+.vscode
+__pycache__/
+6models_save_eval
